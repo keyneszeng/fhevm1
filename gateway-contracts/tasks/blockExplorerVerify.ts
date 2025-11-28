@@ -1,261 +1,171 @@
-import { task, types } from "hardhat/config";
+const { task } = require("hardhat/config");
 
-import { getRequiredEnvVar, loadGatewayAddresses } from "./utils";
+// ==========================================
+// 1. 配置区域：在这里统一管理所有合约
+// ==========================================
+const CONTRACT_CONFIGS = [
+  {
+    name: "CiphertextCommits",
+    envKey: "CIPHERTEXT_COMMITS_ADDRESS",
+    isProxy: true, // 标记为代理合约，会自动验证 Implementation
+  },
+  {
+    name: "Decryption",
+    envKey: "DECRYPTION_ADDRESS",
+    isProxy: true,
+  },
+  {
+    name: "PrecompileCostEstimator",
+    envKey: "PRECOMPILE_COST_ESTIMATOR_ADDRESS",
+    isProxy: true,
+  },
+  {
+    name: "CiphertextResults",
+    envKey: "CIPHERTEXT_RESULTS_ADDRESS",
+    isProxy: true,
+  },
+  {
+    name: "GatewayContract",
+    envKey: "GATEWAY_CONTRACT_ADDRESS",
+    isProxy: true,
+  },
+  {
+    name: "PauserSet",
+    envKey: "PAUSER_SET_ADDRESS",
+    isProxy: false, // PauserSet 似乎不是代理，标记为 false
+  },
+  {
+    name: "FhevmParams",
+    envKey: "FHEVM_PARAMS_ADDRESS",
+    isProxy: true,
+  },
+  {
+    name: "BytecodeRegistry",
+    envKey: "BYTECODE_REGISTRY_ADDRESS",
+    isProxy: true,
+  },
+];
 
-task("task:verifyCiphertextCommits")
-  .addOptionalParam(
-    "useInternalProxyAddress",
-    "If proxy address from the /addresses directory should be used",
-    false,
-    types.boolean,
-  )
-  .setAction(async function ({ useInternalProxyAddress }, { upgrades, run }) {
-    if (useInternalProxyAddress) {
-      loadGatewayAddresses();
+// ==========================================
+// 2. 辅助工具函数
+// ==========================================
+
+// 获取环境变量，不存在则抛错
+const getRequiredEnvVar = (envVar) => {
+  const value = process.env[envVar];
+  if (!value) {
+    throw new Error(`缺少环境变量: ${envVar}`);
+  }
+  return value;
+};
+
+// 简单的延时函数，防止触发 Etherscan API 速率限制
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// 通用验证核心逻辑
+const verifyContractLogic = async (hre, config) => {
+  const { name, envKey, isProxy } = config;
+  const address = getRequiredEnvVar(envVar);
+  
+  console.log(`\nStarting verification for [${name}] at ${address}...`);
+
+  // 1. 验证主合约 (如果是 Proxy，这里验证的是 Proxy 本身)
+  try {
+    await hre.run("verify:verify", {
+      address: address,
+      constructorArguments: [], // 如果有特定参数，可以在 Config 中扩展
+    });
+    console.log(`✅ [${name}] Contract verified.`);
+  } catch (error) {
+    // 忽略“已验证”的错误，其他错误抛出
+    if (error.message.toLowerCase().includes("already verified")) {
+      console.log(`ℹ️ [${name}] Already verified.`);
+    } else {
+      throw new Error(`Failed to verify ${name}: ${error.message}`);
     }
-    const proxyAddress = getRequiredEnvVar("CIPHERTEXT_COMMITS_ADDRESS");
+  }
 
-    const implementationAddress = await upgrades.erc1967.getImplementationAddress(proxyAddress);
-    await run("verify:verify", {
-      address: proxyAddress,
-      constructorArguments: [],
-    });
-    await run("verify:verify", {
-      address: implementationAddress,
-      constructorArguments: [],
-    });
+  // 2. 如果是代理合约，获取并验证 Implementation
+  if (isProxy) {
+    try {
+      const implAddress = await hre.upgrades.erc1967.getImplementationAddress(address);
+      console.log(`   Detected Implementation for [${name}] at ${implAddress}`);
+      
+      await sleep(1000); // 稍微休息一下，保护 API 调用频率
+
+      await hre.run("verify:verify", {
+        address: implAddress,
+        constructorArguments: [],
+      });
+      console.log(`✅ [${name}] Implementation verified.`);
+    } catch (error) {
+      if (error.message.toLowerCase().includes("already verified")) {
+        console.log(`ℹ️ [${name}] Implementation already verified.`);
+      } else {
+        throw new Error(`Failed to verify Implementation of ${name}: ${error.message}`);
+      }
+    }
+  }
+};
+
+// ==========================================
+// 3. 任务定义
+// ==========================================
+
+// 主任务：批量验证所有网关合约
+task("task:verifyAllGatewayContracts", "Verifies all gateway contracts and their implementations")
+  .setAction(async (taskArgs, hre) => {
+    const results = [];
+    let hasFailure = false;
+
+    console.log("🚀 开始批量验证流程...\n");
+
+    for (const config of CONTRACT_CONFIGS) {
+      const result = { name: config.name, status: "PENDING", error: null };
+      try {
+        await verifyContractLogic(hre, config);
+        result.status = "SUCCESS";
+      } catch (err) {
+        console.error(`❌ Error verifying ${config.name}:`, err.message);
+        result.status = "FAILED";
+        result.error = err.message;
+        hasFailure = true;
+      }
+      results.push(result);
+      
+      // 任务间间隔，避免 API 封禁
+      await sleep(1500); 
+    }
+
+    // ==========================================
+    // 4. 最终汇总报告 (CI/CD 关键部分)
+    // ==========================================
+    console.log("\n==========================================");
+    console.log("             验证结果汇总 Report           ");
+    console.log("==========================================");
+    
+    console.table(results.map(r => ({
+      Contract: r.name,
+      Status: r.status,
+      Error: r.error ? r.error.substring(0, 50) + "..." : "" // 截断错误信息以便展示
+    })));
+
+    if (hasFailure) {
+      console.error("\n❌ 部分合约验证失败，请检查上方日志。");
+      process.exit(1); // 非零退出码，通知 CI 流水线失败
+    } else {
+      console.log("\n✅ 所有合约验证成功！");
+    }
   });
 
-task("task:verifyDecryption")
-  .addOptionalParam(
-    "useInternalProxyAddress",
-    "If proxy address from the /addresses directory should be used",
-    false,
-    types.boolean,
-  )
-  .setAction(async function ({ useInternalProxyAddress }, { upgrades, run }) {
-    if (useInternalProxyAddress) {
-      loadGatewayAddresses();
+// 这是一个可选的通用任务，如果你只想验证单个合约
+// 用法: npx hardhat task:verifySingle --name CiphertextCommits
+task("task:verifySingle", "Verifies a single contract by name defined in config")
+  .addParam("name", "The name of the contract configuration to use")
+  .setAction(async ({ name }, hre) => {
+    const config = CONTRACT_CONFIGS.find(c => c.name === name);
+    if (!config) {
+      throw new Error(`找不到名为 ${name} 的配置项`);
     }
-    const proxyAddress = getRequiredEnvVar("DECRYPTION_ADDRESS");
-
-    const implementationAddress = await upgrades.erc1967.getImplementationAddress(proxyAddress);
-    await run("verify:verify", {
-      address: proxyAddress,
-      constructorArguments: [],
-    });
-    await run("verify:verify", {
-      address: implementationAddress,
-      constructorArguments: [],
-    });
-  });
-
-task("task:verifyGatewayConfig")
-  .addOptionalParam(
-    "useInternalProxyAddress",
-    "If proxy address from the /addresses directory should be used",
-    false,
-    types.boolean,
-  )
-  .setAction(async function ({ useInternalProxyAddress }, { upgrades, run }) {
-    if (useInternalProxyAddress) {
-      loadGatewayAddresses();
-    }
-    const proxyAddress = getRequiredEnvVar("GATEWAY_CONFIG_ADDRESS");
-
-    const implementationAddress = await upgrades.erc1967.getImplementationAddress(proxyAddress);
-    await run("verify:verify", {
-      address: proxyAddress,
-      constructorArguments: [],
-    });
-    await run("verify:verify", {
-      address: implementationAddress,
-      constructorArguments: [],
-    });
-  });
-
-task("task:verifyInputVerification")
-  .addOptionalParam(
-    "useInternalProxyAddress",
-    "If proxy address from the /addresses directory should be used",
-    false,
-    types.boolean,
-  )
-  .setAction(async function ({ useInternalProxyAddress }, { upgrades, run }) {
-    if (useInternalProxyAddress) {
-      loadGatewayAddresses();
-    }
-    const proxyAddress = getRequiredEnvVar("INPUT_VERIFICATION_ADDRESS");
-
-    const implementationAddress = await upgrades.erc1967.getImplementationAddress(proxyAddress);
-    await run("verify:verify", {
-      address: proxyAddress,
-      constructorArguments: [],
-    });
-    await run("verify:verify", {
-      address: implementationAddress,
-      constructorArguments: [],
-    });
-  });
-
-task("task:verifyKMSGeneration")
-  .addOptionalParam(
-    "useInternalProxyAddress",
-    "If proxy address from the /addresses directory should be used",
-    false,
-    types.boolean,
-  )
-  .setAction(async function ({ useInternalProxyAddress }, { upgrades, run }) {
-    if (useInternalProxyAddress) {
-      loadGatewayAddresses();
-    }
-    const proxyAddress = getRequiredEnvVar("KMS_GENERATION_ADDRESS");
-
-    const implementationAddress = await upgrades.erc1967.getImplementationAddress(proxyAddress);
-    await run("verify:verify", {
-      address: proxyAddress,
-      constructorArguments: [],
-    });
-    await run("verify:verify", {
-      address: implementationAddress,
-      constructorArguments: [],
-    });
-  });
-
-task("task:verifyMultichainACL")
-  .addOptionalParam(
-    "useInternalProxyAddress",
-    "If proxy address from the /addresses directory should be used",
-    false,
-    types.boolean,
-  )
-  .setAction(async function ({ useInternalProxyAddress }, { upgrades, run }) {
-    if (useInternalProxyAddress) {
-      loadGatewayAddresses();
-    }
-    const proxyAddress = getRequiredEnvVar("MULTICHAIN_ACL_ADDRESS");
-
-    const implementationAddress = await upgrades.erc1967.getImplementationAddress(proxyAddress);
-    await run("verify:verify", {
-      address: proxyAddress,
-      constructorArguments: [],
-    });
-    await run("verify:verify", {
-      address: implementationAddress,
-      constructorArguments: [],
-    });
-  });
-
-task("task:verifyPauserSet")
-  .addOptionalParam(
-    "useInternalProxyAddress",
-    "If proxy address from the /addresses directory should be used",
-    false,
-    types.boolean,
-  )
-  .setAction(async function ({ useInternalProxyAddress }, { upgrades, run }) {
-    if (useInternalProxyAddress) {
-      loadGatewayAddresses();
-    }
-    const implementationAddress = getRequiredEnvVar("PAUSER_SET_ADDRESS");
-    await run("verify:verify", {
-      address: implementationAddress,
-      constructorArguments: [],
-    });
-  });
-
-task("task:verifyProtocolPayment")
-  .addOptionalParam(
-    "useInternalProxyAddress",
-    "If proxy address from the /addresses directory should be used",
-    false,
-    types.boolean,
-  )
-  .setAction(async function ({ useInternalProxyAddress }, { upgrades, run }) {
-    if (useInternalProxyAddress) {
-      loadGatewayAddresses();
-    }
-    const proxyAddress = getRequiredEnvVar("PROTOCOL_PAYMENT_ADDRESS");
-
-    const implementationAddress = await upgrades.erc1967.getImplementationAddress(proxyAddress);
-    await run("verify:verify", {
-      address: proxyAddress,
-      constructorArguments: [],
-    });
-    await run("verify:verify", {
-      address: implementationAddress,
-      constructorArguments: [],
-    });
-  });
-
-task("task:verifyAllGatewayContracts")
-  .addOptionalParam(
-    "useInternalProxyAddress",
-    "If proxy address from the /addresses directory should be used",
-    false,
-    types.boolean,
-  )
-  .setAction(async function ({ useInternalProxyAddress }, hre) {
-    try {
-      // to not panic if Blockscout throws an error due to already verified implementation
-      console.log("Verify GatewayConfig contract:");
-      await hre.run("task:verifyGatewayConfig", { useInternalProxyAddress });
-    } catch (error) {
-      console.error("An error occurred:", error);
-    }
-    try {
-      // to not panic if Blockscout throws an error due to already verified implementation
-      console.log("Verify InputVerification contract:");
-      await hre.run("task:verifyInputVerification", { useInternalProxyAddress });
-    } catch (error) {
-      console.error("An error occurred:", error);
-    }
-    try {
-      // to not panic if Blockscout throws an error due to already verified implementation
-      console.log("Verify KMSGeneration contract:");
-      await hre.run("task:verifyKMSGeneration", { useInternalProxyAddress });
-    } catch (error) {
-      console.error("An error occurred:", error);
-    }
-    try {
-      // to not panic if Blockscout throws an error due to already verified implementation
-      console.log("Verify CiphertextCommits contract:");
-      await hre.run("task:verifyCiphertextCommits", { useInternalProxyAddress });
-    } catch (error) {
-      console.error("An error occurred:", error);
-    }
-    try {
-      // to not panic if Blockscout throws an error due to already verified implementation
-      console.log("Verify MultichainACL contract:");
-      await hre.run("task:verifyMultichainACL", { useInternalProxyAddress });
-    } catch (error) {
-      console.error("An error occurred:", error);
-    }
-    try {
-      // to not panic if Blockscout throws an error due to already verified implementation
-      console.log("Verify Decryption contract:");
-      await hre.run("task:verifyDecryption", { useInternalProxyAddress });
-    } catch (error) {
-      console.error("An error occurred:", error);
-    }
-    try {
-      // to not panic if Blockscout throws an error due to already verified implementation
-      console.log("Verify PauserSet contract:");
-      await hre.run("task:verifyPauserSet", { useInternalProxyAddress });
-    } catch (error) {
-      console.error("An error occurred:", error);
-    }
-    try {
-      // to not panic if Blockscout throws an error due to already verified implementation
-      console.log("Verify ProtocolPayment contract:");
-      await hre.run("task:verifyProtocolPayment", { useInternalProxyAddress });
-    } catch (error) {
-      console.error("An error occurred:", error);
-    }
-    try {
-      // to not panic if Blockscout throws an error due to already verified implementation
-      console.log("Contract verification done!");
-    } catch (error) {
-      console.error("An error occurred:", error);
-    }
+    await verifyContractLogic(hre, config);
   });
